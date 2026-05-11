@@ -30,7 +30,41 @@ assert isinstance(envs.single_action_space, gym.spaces.Discrete)
 with torch.no_grad():
 ```
 
+一张全零的$V$表意味着智能体从未到达过终点, 如果只有到达终点有奖励.
 
+![img](assets/img.png)
+
+## gymnasium
+
+对于任何模型,优先`query`它的`action_space`和`observation_space`.
+
+> Every environment specifies the format of valid actions and observations with the [`action_space`](https://gymnasium.farama.org/api/env/#gymnasium.Env.action_space) and [`observation_space`](https://gymnasium.farama.org/api/env/#gymnasium.Env.observation_space) attributes. 
+
+`gym`中用于执行随机策略的函数是
+
+```python
+if not policy:
+    action = lambda _: env.action_space.sample()
+```
+
+也有`restricted_policy`,限制策略本质上是限制策略对应的`index`.注意`action_space.n`表示全体合法行动数量.
+
+```python
+if self.restricted_policy is None:
+    return lambda _:np.random.randint(self.env.action_space.n//2)
+```
+
+After receiving our first observation from `env.reset()`, we use `env.step(action)` to interact with the environment.
+
+```
+observation, reward, terminated, truncated, info = env.step(action)
+```
+
+- **`observation`**: What the agent sees after taking the action (new game state)
+- **`reward`**: Immediate feedback for that action (+1, -1, or 0 in Blackjack)
+- **`terminated`**: Whether the episode ended naturally (hand finished)
+- **`truncated`**: Whether episode was cut short (time limits - not used in Blackjack)
+- **`info`**: Additional debugging information (can usually be ignored)
 
 ### 训练逻辑`ppo.py`
 
@@ -57,7 +91,7 @@ with torch.no_grad():
    $$
 
 3. `global_step`的作用仅仅是`Timestamp`吗? :thinking:.​
-    可用于表示环境总交互量,和训练数据量直接挂钩, 是固定的训练*成本*上限.
+   可用于表示环境总交互量,和训练数据量直接挂钩, 是固定的训练*成本*上限.
 
    ```python
    for step in range(0, args.num_steps):
@@ -68,7 +102,29 @@ with torch.no_grad():
 
    [异步更新]注意这里是`post update`, 在`step 1`计算出的`step 2`的值`obs`,`done`,要等到`step 2`才能记录. 所以`terminal`的`next_obs`和`next_done`都是"游离状态". 
 
-4. GAE广义优势估计
+4. 进行训练.
+
+   ```python
+   with torch.no_grad():
+       action, logprob, _, value = agent.get_action_and_value(next_obs)
+       values[step] = value.flatten()
+   actions[step] = action
+   logprobs[step] = logprob
+   ```
+
+   ```python
+   next_obs, reward, terminations, truncations, infos = env.step(action.cpu().numpy()) # 回传CPU
+   next_done = np.logical_or(terminations, truncations)
+   rewards[step] = torch.tensor(reward).to(device).view(-1)
+   ```
+
+   ```python
+   next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+   ```
+
+   
+
+5. GAE广义优势估计
 
    ```python
    with torch.no_grad():
@@ -118,4 +174,135 @@ with torch.no_grad():
    提升更新效率,追求*比预期更好*.
 
    > `bias`和`variance`的区别:采样越少,偏差越大,方差越小. 反之亦然.
+
+6. `tensor`创建与克隆
+
+   ```python
+   values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+   actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device) # 注意这里创建参数
+   advantages = torch.zero_like(rewards).to(device)
+   ```
+
+   这里的`+`号对应元组拼接,表示最终结果的第一维是`batch`序号,后面保持原本的维度不变.
+
+7. `batch`处理
+
+   ```python
+   b_inds = np.arange(args.batch_size)
+   ```
+
+   ```python
+   for epoch in range(args.update_epoch):
+        np.random.shuffle(b_inds)
+   ```
+
+   ```python
+   for start in range(0, args.batch_size, args.minibatch_size):
+       end = start + minibatch_size
+       mb_inds = b_inds[start : end]
+       
+       _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+       logration = newlogprob - b_logprobs[mb_inds]
+       ration = logration.exp()
+   ```
+
+   将`array`扔进张量中等于扔进去一张index表. 注意算法设计:先随机排序`np.random.shuffle`,再顺序取,避免重复取到同一个样本.
+   `agent.get_action_and_value`是如何工作的? :thinking:
+
+8. `approx_kl`
+
+   ```python
+   with torch.no_grad():
+       old_approx_kl = (-logratio).mean()
+       approx_kl = ((ratio - 1) - logratio).mean()
+       clipfracs += [((ratio - 1.0).abs() > args.clip.coef).float().mean().item()]
+   ```
+
+   似乎是用于提前终止当前`epoch`训练的. (一个`epoch`最多更新这么多), 其中$p(x),q(x)$分别是新策略,旧策略.
+   $$
+   KL[q,p]=E_{q(x)}[\log\frac{q(x)}{p(x)}]
+   $$
+   An estimator can be
+   $$
+   KL[q,p]:(r-1)-\log r,\ \ \ r=\frac{p(x)}{q(x)}
+   $$
+   想起来信息论里面学过的$D(q||p)$.实际上简单的`env.clip_coef`应该就够用,本质上是限制策略更新速度.
+
+   > $D(q||p)$在信息论中是relative entropy, *a distance between distributions*.这是*非对称*的,衡量$q$相对于$p$的信息变化量.
+
+9. 正则化`advantages`
+
+   ```python
+   mb_advantages = b_advantages[mb_inds]
+   if args.norm_adv:
+       mb_advantages = (mb_advantages - mb_advantages.mean()) /(mb_advantages.std() + 1e-8)
+   ```
+
+   $$
+   \hat A=\frac{A-\bar A}{\sigma_A+\epsilon}
+   $$
+
+10. `policy_loss`:Clipped Surrogate Objective
+
+   ```python
+   pg_loss1 = -mb_advantages * ratio
+   pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+   pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+   ```
+
+   防止张量过大更新太快. 这里所有的`mean()`都只是基于不同`minibatch`结果的平均,旨在减小误差,不具有数学意义.
+
+11. `value_loss` 
+
+   ```python
+   newvalue = newvalue.view(-1)
+   v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+   ```
+
+11. `loss` 结合`entropy_loss`
+
+    ```python
+    entropy_loss = entropy.mean()
+    loss = pg_loss - args.ent_coef * entropy_loss + value_loss * args.vf_coef
+    ```
+
+    $$
+    \mathbb{L}_{total}=\mathbb{L}_{pg}-c_{entropy}\mathbb{L}_{entropy}+c_{value}\mathbb{L}_{value}
+    $$
+
+12. `optimizer`.
+
+    ```python
+    optimizer.zero_grad()
+    loss.backward()
+    nn.utils.clip_grad_norm_(agent.parameters(),args.max_grad_norm)
+    optimizer.step()
+    ```
+
+    > 1. 清空梯度
+    > 2. 反向传播
+    > 3. 裁剪梯度
+    > 4. 更新参数
+
+#### PPO 和 Q-learning
+
+1. 都是`off-policy`.都根据策略$A$更新策略$B$.
+2. PPO需要重要性采样 $r=p(x)/q(x)$来修正policy distribution. 采样一次,训练多次`epoch`.
+3. Q Learning的目标策略$B$是隐式的,只有在最终Q表更新完成后才会一步更新.
+
+## Monte Carlo
+
+$G_t$表示$t\to T$的所有discounted rewards.
+$$
+G_t=\sum_{k=0}^{T-t-1}\gamma^kR_{t+1+k}
+$$
+RL作业中`termination function`$\gamma(S_t)$对应的变体是
+$$
+G_t=\sum_{k=0}^{T-t-1}(\prod_{i=0}^k\gamma(S_{t+k}))R_{t+k+1}
+$$
+一个有趣的公式(我之前从来没见过)
+$$
+V(s)=\frac{\sum_{t=1}^T\bold 1[S_t=s]G_t}{\sum_{t=1}^T\bold 1[S_t=s]}
+$$
+这是所谓的`every visit`,也就是$t\to T$中只要遇到$s$,就加入平均值计算中.
 

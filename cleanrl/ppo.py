@@ -239,7 +239,7 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        b_inds = np.arange(args.batch_size) # 反复使用采样数据进行多轮更新
         clipfracs = []
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
@@ -248,7 +248,7 @@ if __name__ == "__main__":
                 mb_inds = b_inds[start:end]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
+                logratio = newlogprob - b_logprobs[mb_inds] # r = p(x) / q(x)
                 ratio = logratio.exp()
 
                 with torch.no_grad():
