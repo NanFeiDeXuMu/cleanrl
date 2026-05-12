@@ -164,7 +164,7 @@ observation, reward, terminated, truncated, info = env.step(action)
 
    `advantages`是相对优势的度量,注意公式
    $$
-   \nabla_\theta J(\theta)=\mathbb{E}_{\pi_\theta}[\nabla_\theta\pi_\theta(s_t,a_t)\hat{A}_t^{GAE}]
+   \nabla_\theta J(\theta)=\mathbb{E}_{\pi_\theta}[\nabla_\theta\ln\pi_\theta(s_t,a_t)\hat{A}_t^{GAE}]
    $$
 
    $$
@@ -173,7 +173,15 @@ observation, reward, terminated, truncated, info = env.step(action)
 
    提升更新效率,追求*比预期更好*.
 
-   > `bias`和`variance`的区别:采样越少,偏差越大,方差越小. 反之亦然.
+   > `bias`和`variance`的区别:采样越少,偏差越大,方差越小. 反之亦然. $\lambda\in[0,1]$,PPO在高方差与高偏差之间做平衡.
+
+   最后计算每个$t$时刻的$G_t$.
+
+   ```python
+   returns = advantages + rewards
+   ```
+
+   注意三个变量均为`Tensor`.
 
 6. `tensor`创建与克隆
 
@@ -230,7 +238,7 @@ observation, reward, terminated, truncated, info = env.step(action)
 
    > $D(q||p)$在信息论中是relative entropy, *a distance between distributions*.这是*非对称*的,衡量$q$相对于$p$的信息变化量.
 
-9. 正则化`advantages`
+9. 归一化`advantages`
 
    ```python
    mb_advantages = b_advantages[mb_inds]
@@ -288,7 +296,14 @@ observation, reward, terminated, truncated, info = env.step(action)
 
 1. 都是`off-policy`.都根据策略$A$更新策略$B$.
 2. PPO需要重要性采样 $r=p(x)/q(x)$来修正policy distribution. 采样一次,训练多次`epoch`.
-3. Q Learning的目标策略$B$是隐式的,只有在最终Q表更新完成后才会一步更新.
+3. Q Learning的目标策略$B$是隐式的,只有在最终Q表更新完成后才会一步更新.(在实践中,时刻追逐$\max$容易被噪声干扰).
+
+#### PPO特点
+
+先采样一次`logprobs`,后续通过importance sampling把旧策略产生的数据用于估计新策略的梯度,并反复更新直到relative entropy达到`args.target_kl`的阈值. 每一轮`iteration`结束后,旧数据会被彻底丢弃,并以当前最新的$\pi$重新采样.
+$$
+Sampling\to Batching\to Updating\to Sampling
+$$
 
 ## Monte Carlo
 
@@ -306,3 +321,60 @@ V(s)=\frac{\sum_{t=1}^T\bold 1[S_t=s]G_t}{\sum_{t=1}^T\bold 1[S_t=s]}
 $$
 这是所谓的`every visit`,也就是$t\to T$中只要遇到$s$,就加入平均值计算中.
 
+### 训练逻辑`dqn.py`
+
+1. `ReplayBuffer`
+
+   ```python
+   rb = ReplayBuffer(args.buffer_size, envs.single_observation_space, envs.single_action_space, device, handle_timeout_termination=False)
+   ```
+
+   联想到`ppo.py`中利用$\pi_{old}$产生的`b_obs[md_inds]`和`b_actions.long()[mb_inds]`传入`agent.get_action_and_value`中以获取新的`newlogprob`.
+
+   然而`rb`可以添加初始化时没有的元素 :laughing:.
+
+   ```python
+   rb.add(obs, real_next_obs, actions, rewards, terminations, infos) # 所有参数均为ndarray,表示并行envs
+   ```
+
+2. 计算$\epsilon$-greedy policy.
+
+   ```python
+   epsilon = ...
+   if np.random.random() < epsilon: ...
+   else:
+       q_values = q_network(torch.Tensor(obs).to(device))
+       actions = torch.argmax(q_values, dim=1).cpu().numpy()
+   ```
+
+   注意`obs`的初始化和更新: (实际上在Q-Learning那里已经吃了一次亏了)
+
+   ```python
+   obs, _ = envs.reset(seed = args.seed)
+   for global_step in range(args.global_total_timesteps):
+       ...
+   rb.add(...)
+   obs = next_obs
+   ```
+
+3. 计算$TD\ loss$​.
+   $$
+   Q(S_t,A_t)\leftarrow Q(S_t,A_t)+\alpha(R_{t+1}+\gamma\max_a Q(S_{t+1},a)-Q(S_t,A_t))
+   $$
+   本质上需要知道下一个`next_observation`才能使用$\max$算子.
+
+   ```python
+   data = rb.sample(args.batch_size)
+   with torch.no_grad():
+       target_max, _ = target_network(data.next_observations).max(dim=1)
+       td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
+   old_val = q_network(data.observations).gather(1, data.actions).squeeze()
+   ```
+
+   `QNetwork`从哪里冒出来能够接收`Tensor`的函数? :thinking:.​
+
+   ```python
+   loss = F.mse_loss(td_target, old_val)
+   ```
+
+   
