@@ -34,6 +34,15 @@ with torch.no_grad():
 
 ![img](assets/img.png)
 
+`array`按`column`或`row`计算
+
+```python
+policy = np.zeros([num_state, num_action])
+policy[:, 0] = 1
+```
+
+这和`Tensor`中的`reshape(-1)`类似,即只保留某个维度,其余维度展平.
+
 ## gymnasium
 
 对于任何模型,优先`query`它的`action_space`和`observation_space`.
@@ -377,4 +386,90 @@ $$
    loss = F.mse_loss(td_target, old_val)
    ```
 
-   
+
+### RL Assignment(1/2)
+
+`policy`是$[state,action]\to R_{[0,1]}$的函数.
+
+`random_policy`
+
+```python
+policy = None
+num_state = env.observation_sapce.n
+num_action = env.action_space.n
+policy = np.ones([num_state, num_action]) / num_action
+```
+
+$$
+\sum_{a\in A}\pi(a|S)=1
+$$
+
+Tips:这其实符合$MECE$的商业分析原则,不重不漏.
+
+`env.P[state][action]`和`env.step(action)`对比
+
+```python
+prob, next_state, reward, termination = env.P[state][action]
+next_state, reward, termination, truncation, info = env.step(action)
+```
+
+$Transition$状态转移矩阵额外提供一个状态转移概率,使得$DP$分析成为可能. 
+
+`delta` control, 控制$V$表收敛.
+
+```python
+while True:
+    delta = 0
+    for state in range(env.observation_space.n):
+        ...
+    	delta = max(delta, abs(V[state] - v))
+    if delta < theta:
+        break
+```
+
+`policy_stable` control,控制$\pi$更新.
+
+```python
+while True:
+    policy_stable = True
+    V = policy_evaluation(policy, env, gamma, theta)
+    for state in range(nS):
+        old_policy = np.argmax(policy[state])
+        new_policy = np.argmax(Q[state])
+        if old_policy != new_policy:
+            policy_stable = False
+        policy[state, :] = 0
+        policy[state, new_policy] = 1
+    if policy_stable:
+        break
+```
+
+policy iteration的流程是
+$$
+Evaluation\to \arg\max Q\to Update
+$$
+`value iteration`原理类似,只不过在`delta` control下改成$\max$算子.
+
+```python
+for s in range(nS):
+    Q[state] = one_step_lookahead(s,V, env, gamma)
+    best_value = np.max(Q[state])
+    delta = np.max(delta, np.abs(best_value - V[s]))
+    V[s] = best_value # 不要忘记更新了
+```
+
+Asynchronous Value Iteration是什么? :thinking:. 好吧,实际上上面这个`block`就是. 同步更新要等到所有$V$值计算完成后才会更新, 要维护$V_{new}$和$V_{old}$两张表.​
+
+`episode`由`[state, action, reward, next_state]`构成. 
+
+#### MC/TD
+
+注意`counts`字典以及`visited`集合的使用,实现均值计算+first visit算法. 同时通过给定的`policy`直接采样一整个rollout. $TD(0)$也是用整个rollout采样,但是直接用$TD\ error$来更新,而不是真实采样值$G_t$.
+
+#### Q-Learning/SARSA
+
+![image-20260513093846640](assets/image-20260513093846640.png)
+
+![image-20260513093910071](assets/image-20260513093910071.png)
+
+对比二者,很明显直接采用$\max$算子的Q-Learning震荡更严重,更不容易收敛,这也是off-policy策略的通病,即对噪声的放大.
