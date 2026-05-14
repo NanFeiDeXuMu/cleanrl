@@ -1,3 +1,7 @@
+[TOC]
+
+
+
 ### 杂项
 
 常用依赖安装指令
@@ -340,7 +344,7 @@ $$
 
    联想到`ppo.py`中利用$\pi_{old}$产生的`b_obs[md_inds]`和`b_actions.long()[mb_inds]`传入`agent.get_action_and_value`中以获取新的`newlogprob`.
 
-   然而`rb`可以添加初始化时没有的元素 :laughing:.
+   然而`rb`可以添加初始化时没有的元素 :laughing:. 这个初始化实际上是传递特殊的`observation_space` `action_space`的维度,其他的就用`(num_step, num_env)`就可以了.
 
    ```python
    rb.add(obs, real_next_obs, actions, rewards, terminations, infos) # 所有参数均为ndarray,表示并行envs
@@ -385,6 +389,8 @@ $$
    ```python
    loss = F.mse_loss(td_target, old_val)
    ```
+
+$DQN$算法的`ReplayBuffer`是不断膨胀的,没有显式维护`observations`序列,因为所有的样本均为随机采样 `data = rb.sample(args.batch_size)`.
 
 
 ### RL Assignment(1/2)
@@ -473,3 +479,29 @@ Asynchronous Value Iteration是什么? :thinking:. 好吧,实际上上面这个`
 ![image-20260513093910071](assets/image-20260513093910071.png)
 
 对比二者,很明显直接采用$\max$算子的Q-Learning震荡更严重,更不容易收敛,这也是off-policy策略的通病,即对噪声的放大.
+
+### 训练逻辑`pqn.py`
+
+关键起点
+
+```python
+with torch.no_grad():
+    q_values = q_network(next_obs) # state to [action, value]
+    max_actions = torch.argmax(q_values, dim=1)
+    values[step] = q_values[torch.arange(args.num_envs), max_actions].flatten() # reward是采样的,value是Q-Network生成的
+```
+
+`values`表始终根据最大值来. 这和$PPO$算法一样,都先进行完整的*有序*采样.
+
+#### 更新公式
+
+$$
+G_t=R_t+\gamma (\lambda_qG_{t+1}+(1-\lambda_q)V(S_{t+1}))
+$$
+
+注意$\lambda_q=1$时为$MC$, $\lambda_q=0$时为$TD$.
+
+```python
+nn.utils.clip_grad_norm_(q_network,parameters(), args.max_grad_norm)
+```
+
