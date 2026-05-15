@@ -491,7 +491,37 @@ with torch.no_grad():
     values[step] = q_values[torch.arange(args.num_envs), max_actions].flatten() # reward是采样的,value是Q-Network生成的
 ```
 
-`values`表始终根据最大值来. 这和$PPO$算法一样,都先进行完整的*有序*采样.
+`values`表始终根据最大值来. 这和$PPO$算法一样,都先进行完整的*有序*采样. 但是注意$PPO$​中`values[step]`的计算
+
+```python
+with torch.no_grad():
+    action, logprob, _, value = agent.get_action_and_value(next_obs)
+```
+
+这个神秘函数`agent.get_action_and_value()`定义是
+
+```python
+def get_action_and_value(self, x, action=None):
+    logits = self.actor(x)
+    probs = Categorical(logits=logits)
+    if action is None:
+        action = probs.sample()
+    return action, probs.log_prob(action), probs.entropy(), self.critic()
+```
+
+什么是`self.actor`和`self.critic`? *神经网络*.
+$$
+Actor:R^{obs}\to R^{act},\ Critic:R^{obs}\to R
+$$
+
+
+```python
+self.critic = nn.Sequential(
+layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)), nn.Tanh(), layer_init(nn.Linear(64, 64)), nn.Tanh(), layer_init(nn.Linear(64, 1), std=1.0)
+)
+```
+
+`self.actor`把`1`改成`envs.single_action_space.n`. :thinking:.​
 
 #### 更新公式
 
@@ -502,6 +532,32 @@ $$
 注意$\lambda_q=1$时为$MC$, $\lambda_q=0$时为$TD$.
 
 ```python
-nn.utils.clip_grad_norm_(q_network,parameters(), args.max_grad_norm)
+nn.utils.clip_grad_norm_(q_network.parameters(), args.max_grad_norm)
 ```
+
+### 神经网络($NN$)
+
+一些有趣的小东西
+
+```python
+@lazy_property
+def logits(self):
+    return probs_to_logits(self.probs)
+
+@lazy_property # 推迟直到该元素被使用
+def probs(self):
+    return logits_to_probs(self.logits)
+```
+
+通过`self.actor`神经网络计算`action`的对数概率
+
+```python
+def log_prob(self, value):
+    value = value.long().unsqueeze(-1)
+    value, log_pmf = torch.broadcast_tensors(value, self.logits)
+    value = value[..., :1]
+    return log_pmf.gather(-1, value).squeeze(-1)
+```
+
+
 
