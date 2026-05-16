@@ -505,13 +505,13 @@ def get_action_and_value(self, x, action=None):
     logits = self.actor(x)
     probs = Categorical(logits=logits)
     if action is None:
-        action = probs.sample()
+        action = probs.sample() # 基于actor产生的probs来采样
     return action, probs.log_prob(action), probs.entropy(), self.critic()
 ```
 
 什么是`self.actor`和`self.critic`? *神经网络*.
 $$
-Actor:R^{obs}\to R^{act},\ Critic:R^{obs}\to R
+Actor:S_t\to A_t,\ Critic:S_t\to V(S_t)
 $$
 
 
@@ -521,15 +521,16 @@ layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
 )
 ```
 
-`self.actor`把`1`改成`envs.single_action_space.n`. :thinking:.​
-
-#### 更新公式
-
+`self.actor`把`1`改成`envs.single_action_space.n`. :thinking:. `nn.Tanh`是激活函数
+$$
+tanh=\frac{e^x-e^{-x}}{e^x+e^{-x}}\in[-1,1]
+$$
+更新公式
 $$
 G_t=R_t+\gamma (\lambda_qG_{t+1}+(1-\lambda_q)V(S_{t+1}))
 $$
 
-注意$\lambda_q=1$时为$MC$, $\lambda_q=0$时为$TD$.
+注意$\lambda_q=1$时为$MC$, $\lambda_q=0$时为$TD$. 
 
 ```python
 nn.utils.clip_grad_norm_(q_network.parameters(), args.max_grad_norm)
@@ -559,5 +560,24 @@ def log_prob(self, value):
     return log_pmf.gather(-1, value).squeeze(-1)
 ```
 
+### 训练逻辑`ppo_continuous_action.py`
 
+关键起点
+
+```python
+def get_action_and_value(self, x, action=None):
+    action_mean = self.actor_mean(x)
+    action_logstd = self.actor_logstd.expand_as(action_mean)
+    action_std = torch.exp(action_logstd)
+    probs = Normal(action_mean, action_std)
+    if action is None:
+        action = probs.sample()
+    return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+```
+
+高斯策略. 基于$a:N(\mu,\sigma^2)$生成动作概率分布`probs`. `nn.Sequential`神经网络只生成`actor_mean`, `actor_logstd`由
+
+```python
+self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+```
 
